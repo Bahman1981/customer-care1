@@ -5,10 +5,352 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta http-equiv="X-Frame-Options" content="DENY">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' https://fonts.googleapis.com https://fonts.gstatic.com https://cdnjs.cloudflare.com https://api.anthropic.com; img-src 'self' data: blob: https:; connect-src 'self' https://api.anthropic.com;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' https://fonts.googleapis.com https://fonts.gstatic.com https://cdnjs.cloudflare.com https://api.anthropic.com https://*.supabase.co wss://*.supabase.co; img-src 'self' data: blob: https:; connect-src 'self' https://api.anthropic.com https://*.supabase.co wss://*.supabase.co;">
 <title>Customer Care System v1.0</title>
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+// ══════════════════════════════════════════════════════════════
+//  SUPABASE CONFIG — ضع بياناتك هنا
+// ══════════════════════════════════════════════════════════════
+let SUPABASE_URL  = localStorage.getItem('cc_sb_url') || 'YOUR_SUPABASE_URL';
+let SUPABASE_KEY  = localStorage.getItem('cc_sb_key') || 'YOUR_SUPABASE_ANON_KEY';
+
+let _sb = null;
+function getSB(){
+  if(!_sb){
+    if(SUPABASE_URL==='YOUR_SUPABASE_URL'){
+      console.warn('⚠️ لم يتم ضبط Supabase. التطبيق يعمل بوضع offline.');
+      return null;
+    }
+    _sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  }
+  return _sb;
+}
+
+// ── هل Supabase مُعدَّل؟ ──────────────────────────────────────
+function isSupabaseReady(){
+  return SUPABASE_URL !== 'YOUR_SUPABASE_URL' && SUPABASE_KEY !== 'YOUR_SUPABASE_ANON_KEY';
+}
+
+// ── مزامنة فورية (Realtime) ────────────────────────────────────
+let _realtimeChannel = null;
+function startRealtimeSync(){
+  const sb = getSB(); if(!sb) return;
+  if(_realtimeChannel) _realtimeChannel.unsubscribe();
+  _realtimeChannel = sb.channel('cc_realtime')
+    .on('postgres_changes', {event:'*', schema:'public', table:'cc_users'},    () => sbLoadUsers())
+    .on('postgres_changes', {event:'*', schema:'public', table:'cc_files'},    () => sbLoadFiles())
+    .on('postgres_changes', {event:'*', schema:'public', table:'cc_history'},  () => sbLoadHistory())
+    .on('postgres_changes', {event:'*', schema:'public', table:'cc_messages'}, () => { sbLoadMessages(); updateInboxBadge(); })
+    .on('postgres_changes', {event:'*', schema:'public', table:'cc_settings'}, () => sbLoadSettings())
+    .subscribe();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  SUPABASE DATA LAYER — بدلاً من localStorage
+// ══════════════════════════════════════════════════════════════
+
+// ── USERS ─────────────────────────────────────────────────────
+async function sbLoadUsers(){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {data,error} = await sb.from('cc_users').select('*').order('id');
+    if(error) throw error;
+    // تحويل تنسيق Supabase → تنسيق التطبيق
+    registeredUsers = (data||[]).map(u=>({
+      id:u.id, role:u.role, user:u.username, pass:u.pass,
+      name:u.name, org:u.org||'', natId:u.nat_id||'',
+      phone:u.phone||'', email:u.email||'', status:u.status||'active',
+      permissions:u.permissions||{}, lastLogin:u.last_login, createdAt:u.created_at
+    }));
+    USERS = registeredUsers.map(u=>({id:u.id,name:u.name,user:u.user,pass:u.pass,role:u.role,
+      avatar:u.role==='admin'?'👑':'👤',color:u.role==='admin'?'#dc2626':'#d97706'}));
+    renderUsersTable();
+    updateStats();
+  }catch(e){ console.error('sbLoadUsers:',e); }
+}
+
+async function sbSaveUser(u){
+  const sb = getSB(); if(!sb) { saveUsersToLS(); return; }
+  try{
+    const row = {
+      id:u.id, role:u.role, username:u.user, pass:u.pass,
+      name:u.name, org:u.org||'', nat_id:u.natId||'',
+      phone:u.phone||'', email:u.email||'', status:u.status||'active',
+      permissions:u.permissions||{}
+    };
+    const {error} = await sb.from('cc_users').upsert(row, {onConflict:'id'});
+    if(error) throw error;
+  }catch(e){ console.error('sbSaveUser:',e); toast('⚠️ فشل حفظ المستخدم: '+e.message,'warn'); }
+}
+
+async function sbDeleteUser(id){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {error} = await sb.from('cc_users').delete().eq('id',id);
+    if(error) throw error;
+  }catch(e){ console.error('sbDeleteUser:',e); }
+}
+
+async function sbSaveAllUsers(){
+  if(!isSupabaseReady()){ saveUsersToLS(); return; }
+  for(const u of registeredUsers) await sbSaveUser(u);
+}
+
+// ── FILES ─────────────────────────────────────────────────────
+async function sbLoadFiles(){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {data,error} = await sb.from('cc_files').select('*').order('id');
+    if(error) throw error;
+    // تحميل بيانات كل ملف
+    const files = [];
+    for(const f of (data||[])){
+      const {data:recs, error:rErr} = await sb.from('cc_records')
+        .select('row_idx, row_data')
+        .eq('file_id', f.id)
+        .order('row_idx');
+      if(rErr) throw rErr;
+      const rows = (recs||[]).map(r => r.row_data);
+      // إعادة بناء الفهارس
+      const idIndex = new Map();
+      const nameIndex = new Map();
+      rows.forEach((row,i)=>{
+        const k = String(row[f.id_col]||'').trim();
+        if(k) idIndex.set(k,i);
+        if(f.name_col>=0){
+          const nk = typeof normalizeAr==='function'?normalizeAr(row[f.name_col]||''):String(row[f.name_col]||'').toLowerCase();
+          if(nk){if(!nameIndex.has(nk))nameIndex.set(nk,[]);nameIndex.get(nk).push(i);}
+        }
+      });
+      files.push({
+        id:f.id, name:f.name, idCol:f.id_col, nameCol:f.name_col,
+        extraCols:f.extra_cols||[], headers:f.headers||[],
+        prompt:f.prompt||'', uploadedBy:f.uploaded_by, uploadedAt:f.uploaded_at,
+        data:rows, idIndex, nameIndex
+      });
+    }
+    appState.files = files;
+    rebuildClientIndex();
+    updateAll();
+  }catch(e){ console.error('sbLoadFiles:',e); }
+}
+
+async function sbSaveFileMeta(f){
+  const sb = getSB(); if(!sb) return null;
+  try{
+    const row = {
+      name:f.name, id_col:f.idCol, name_col:f.nameCol,
+      extra_cols:f.extraCols, headers:f.headers,
+      prompt:f.prompt||'', uploaded_by:f.uploadedBy||'',
+      uploaded_at:new Date().toISOString(), record_count:f.data.length
+    };
+    if(f.id && f.id > 0){
+      const {error} = await sb.from('cc_files').update(row).eq('id',f.id);
+      if(error) throw error;
+      return f.id;
+    } else {
+      const {data,error} = await sb.from('cc_files').insert(row).select('id').single();
+      if(error) throw error;
+      return data.id;
+    }
+  }catch(e){ console.error('sbSaveFileMeta:',e); toast('❌ فشل حفظ الملف: '+e.message,'err'); return null; }
+}
+
+async function sbSaveFileRecords(fileId, rows){
+  const sb = getSB(); if(!sb) return;
+  // حذف السجلات القديمة ثم إدراج الجديدة (batch)
+  try{
+    await sb.from('cc_records').delete().eq('file_id', fileId);
+    const BATCH = 500;
+    for(let i=0; i<rows.length; i+=BATCH){
+      const batch = rows.slice(i,i+BATCH).map((row,j)=>({
+        file_id:fileId, row_idx:i+j, row_data:row
+      }));
+      const {error} = await sb.from('cc_records').insert(batch);
+      if(error) throw error;
+    }
+  }catch(e){ console.error('sbSaveFileRecords:',e); throw e; }
+}
+
+async function sbDeleteFile(fileId){
+  const sb = getSB(); if(!sb) return;
+  try{
+    // السجلات تُحذف تلقائياً عبر CASCADE
+    const {error} = await sb.from('cc_files').delete().eq('id',fileId);
+    if(error) throw error;
+  }catch(e){ console.error('sbDeleteFile:',e); }
+}
+
+// ── HISTORY ───────────────────────────────────────────────────
+async function sbAddHistory(item){
+  const sb = getSB(); if(!sb) { lsSave(LS.history,appState.history); return; }
+  try{
+    const {error} = await sb.from('cc_history').insert({
+      query_id:String(item.id||''), file_name:item.file,
+      success:item.success, response:item.response,
+      username:item.user, user_role:appState.user?.role||'',
+      created_at: new Date().toISOString()
+    });
+    if(error) throw error;
+  }catch(e){ console.error('sbAddHistory:',e); }
+}
+
+async function sbLoadHistory(){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {data,error} = await sb.from('cc_history')
+      .select('*').order('created_at',{ascending:false}).limit(1000);
+    if(error) throw error;
+    appState.history = (data||[]).map(h=>({
+      id:h.query_id, file:h.file_name, success:h.success,
+      response:h.response, user:h.username,
+      time: new Date(h.created_at).toLocaleString('ar-SA'),
+      _ts: new Date(h.created_at).getTime(),
+      _sbId: h.id
+    }));
+    renderHistory();
+    updateStats();
+  }catch(e){ console.error('sbLoadHistory:',e); }
+}
+
+async function sbDeleteHistoryItem(sbId){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {error} = await sb.from('cc_history').delete().eq('id',sbId);
+    if(error) throw error;
+  }catch(e){ console.error('sbDeleteHistoryItem:',e); }
+}
+
+async function sbClearHistory(){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {error} = await sb.from('cc_history').delete().neq('id',0);
+    if(error) throw error;
+  }catch(e){ console.error('sbClearHistory:',e); }
+}
+
+// ── AUDIT ─────────────────────────────────────────────────────
+async function sbAddAudit(item){
+  const sb = getSB(); if(!sb) return;
+  try{
+    await sb.from('cc_audit').insert({
+      type:item.type, action:item.action, details:item.details,
+      username:item.user, user_role:item.role,
+      created_at: new Date().toISOString()
+    });
+  }catch(e){ console.error('sbAddAudit:',e); }
+}
+
+async function sbLoadAudit(){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {data,error} = await sb.from('cc_audit')
+      .select('*').order('created_at',{ascending:false}).limit(500);
+    if(error) throw error;
+    appState.audit = (data||[]).map(a=>({
+      id:a.id, type:a.type, action:a.action, details:a.details||'',
+      user:a.username, role:a.user_role,
+      time: new Date(a.created_at).toLocaleString('ar-SA')
+    }));
+    renderAudit && renderAudit();
+    sv('auditCount', appState.audit.length);
+  }catch(e){ console.error('sbLoadAudit:',e); }
+}
+
+// ── MESSAGES ──────────────────────────────────────────────────
+async function sbSendMessage(msg){
+  const sb = getSB(); if(!sb) { _saveInbox(_getInbox().concat([msg])); return; }
+  try{
+    const {error} = await sb.from('cc_messages').insert({
+      from_id:msg.fromId, from_name:msg.fromName, from_role:msg.fromRole,
+      to_id:msg.toId, to_name:msg.toName,
+      subject:msg.subject, body:msg.body, is_read:false,
+      created_at: new Date().toISOString()
+    });
+    if(error) throw error;
+  }catch(e){ console.error('sbSendMessage:',e); toast('❌ فشل إرسال الرسالة','err'); }
+}
+
+async function sbLoadMessages(){
+  const sb = getSB(); if(!sb) return;
+  const me = appState.user; if(!me) return;
+  try{
+    const {data,error} = await sb.from('cc_messages')
+      .select('*')
+      .or(`to_id.eq.${me.id},from_id.eq.${me.id}`)
+      .order('created_at',{ascending:false});
+    if(error) throw error;
+    // تخزين مؤقت في الذاكرة
+    window._sbMessages = (data||[]).map(m=>({
+      id:m.id, fromId:m.from_id, fromName:m.from_name, fromRole:m.from_role,
+      toId:m.to_id, toName:m.to_name, subject:m.subject, body:m.body,
+      read:m.is_read, time: new Date(m.created_at).toLocaleString('ar-SA'),
+      _sbId:m.id
+    }));
+    updateInboxBadge();
+  }catch(e){ console.error('sbLoadMessages:',e); }
+}
+
+async function sbMarkRead(msgId){
+  const sb = getSB(); if(!sb) return;
+  try{
+    await sb.from('cc_messages').update({is_read:true}).eq('id',msgId);
+  }catch(e){ console.error('sbMarkRead:',e); }
+}
+
+// ── SETTINGS ──────────────────────────────────────────────────
+async function sbLoadSettings(){
+  const sb = getSB(); if(!sb) return;
+  try{
+    const {data,error} = await sb.from('cc_settings').select('*');
+    if(error) throw error;
+    const sys = (data||[]).find(r=>r.key==='system');
+    if(sys?.value){
+      appState.settings = {...appState.settings, ...sys.value};
+      applySidebarBrand && applySidebarBrand();
+    }
+    const wa = (data||[]).find(r=>r.key==='wa_config');
+    if(wa?.value) window._waCfgFromSB = wa.value;
+  }catch(e){ console.error('sbLoadSettings:',e); }
+}
+
+async function sbSaveSettings(key, value){
+  const sb = getSB(); if(!sb) { lsSave(LS.settings, appState.settings); return; }
+  try{
+    const {error} = await sb.from('cc_settings')
+      .upsert({key, value, updated_at:new Date().toISOString()}, {onConflict:'key'});
+    if(error) throw error;
+  }catch(e){ console.error('sbSaveSettings:',e); }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  INIT — تحميل البيانات عند فتح التطبيق
+// ══════════════════════════════════════════════════════════════
+async function sbInit(){
+  if(!isSupabaseReady()){
+    console.log('💡 Supabase غير مُعدَّل — وضع offline (localStorage)');
+    return;
+  }
+  toast('🔄 جاري مزامنة البيانات...','ok');
+  try{
+    await Promise.all([
+      sbLoadUsers(),
+      sbLoadSettings()
+    ]);
+    toast('✅ تمت المزامنة','ok');
+    startRealtimeSync();
+  }catch(e){
+    console.error('sbInit error:',e);
+    toast('⚠️ فشل الاتصال بقاعدة البيانات — وضع offline','warn');
+  }
+}
+
+// تشغيل التهيئة بعد تحميل الصفحة
+document.addEventListener('DOMContentLoaded', ()=>{ sbInit(); });
+</script>
 <script>
 /* 
    MOBILE SIDEBAR
@@ -1382,6 +1724,30 @@ mark.hl{background:#fef08a;color:#92400e;border-radius:3px;padding:0 2px;font-we
           <div class="card-hd"><div class="card-title"><div class="card-icon">👑</div> بيانات حساب مدير النظام</div></div>
           <div class="g2" style="margin-bottom:14px;">
             <div class="fg"><label class="lbl">اسم المستخدم الجديد</label><input class="inp" type="text" id="adminNewUsername" maxlength="30" placeholder="أدخل اسم المستخدم الجديد" autocomplete="off"/></div>
+            <div class="card" style="margin-bottom:18px;background:linear-gradient(135deg,#0f172a,#1e3a8a);border:1px solid rgba(96,165,250,.25);">
+              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                <div style="font-size:28px;">🔗</div>
+                <div style="flex:1">
+                  <div style="font-size:14px;font-weight:800;color:#fff;margin-bottom:4px;">إعداد Supabase — المزامنة السحابية</div>
+                  <div style="font-size:11.5px;color:rgba(147,197,253,.8);">أدخل بيانات Supabase لتفعيل المزامنة بين جميع الأجهزة</div>
+                </div>
+                <span id="sbStatusBadge" style="padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;background:rgba(239,68,68,.2);color:#fca5a5;border:1px solid rgba(239,68,68,.35);">⚫ غير متصل</span>
+              </div>
+              <div style="margin-top:16px;display:grid;grid-template-columns:1fr 1fr;gap:12px;" class="g2-sb-cfg">
+                <div class="fg" style="margin:0;grid-column:1/-1;"><label class="lbl" style="color:rgba(147,197,253,.9);">🌐 Supabase URL</label>
+                  <input class="inp" id="sbUrlInput" placeholder="https://xyz.supabase.co" style="direction:ltr;font-family:monospace;" oninput="updateSBStatus()"/>
+                </div>
+                <div class="fg" style="margin:0;grid-column:1/-1;"><label class="lbl" style="color:rgba(147,197,253,.9);">🔑 Anon Key</label>
+                  <input class="inp" id="sbKeyInput" type="password" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." style="direction:ltr;font-family:monospace;" oninput="updateSBStatus()"/>
+                  <button onclick="togglePassVis('sbKeyInput',this)" style="background:none;border:none;cursor:pointer;font-size:13px;color:var(--b400);float:left;margin-top:3px;">👁 إظهار</button>
+                </div>
+              </div>
+              <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;">
+                <button onclick="saveSBConfig()" class="btn btn-primary">💾 حفظ وتطبيق</button>
+                <button onclick="testSBConnection()" class="btn btn-secondary">🔌 اختبار الاتصال</button>
+                <a href="https://supabase.com/dashboard" target="_blank" class="btn btn-outline">📖 فتح Supabase Dashboard</a>
+              </div>
+            </div>
             <div class="fg"><label class="lbl">📧 البريد الإلكتروني (تنبيهات الاختراق)</label><input class="inp" type="email" id="adminAlertEmail" maxlength="100" placeholder="admin@example.com" class="u-ltr" autocomplete="off"/></div>
             <div class="fg"><label class="lbl">كلمة المرور الحالية (للتحقق)</label><input class="inp" type="password" id="adminCurrentPass" maxlength="64" placeholder="مطلوب لتأكيد الهوية" autocomplete="off"/></div>
             <div class="fg"></div>
@@ -1719,7 +2085,7 @@ mark.hl{background:#fef08a;color:#92400e;border-radius:3px;padding:0 2px;font-we
 
 <div class="toast-wrap" id="toastWrap"></div>
 
-<script>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
 /*  HELPERS  */
 const $  = id => document.getElementById(id);
 const sv = (id,v) => { const e=$(id); if(e) e.textContent=v; };
@@ -1862,7 +2228,7 @@ function safeExportText(fn,content,mime){ try{const a=document.createElement('a'
 
 /* 
    Customer Care System
-   Version : 1.0
+   Version : 6.9
    Last Updated: 2026-03-01
    Sections: Storage | State | Theme | Audit | Charts |
              Login | Navigation | Files | Search | History |
@@ -2151,7 +2517,10 @@ function _initUsers(){
 }
 // حفظ المستخدمين — مباشر بدون تشفير AES
 function saveUsersToLS(){
+  // تحديث localStorage كـ fallback
   lsSave(LS.users, registeredUsers);
+  // تحديث Supabase إذا كان مُعدَّلاً
+  if(isSupabaseReady && isSupabaseReady()) sbSaveAllUsers();
 }
 
 /*  THEME  */
@@ -2173,16 +2542,18 @@ function toggleDark(){const dark=document.body.classList.toggle('dark');lsSave(L
 /*  AUDIT LOG  */
 const AUDIT_TYPES={login:{icon:'🔑',color:'rgba(16,185,129,.12)',textColor:'#059669',cls:'ab-login'},logout:{icon:'🚪',color:'rgba(100,116,139,.1)',textColor:'#475569',cls:'ab-logout'},upload:{icon:'📤',color:'rgba(59,130,246,.1)',textColor:'#2563eb',cls:'ab-upload'},delete:{icon:'🗑',color:'rgba(239,68,68,.1)',textColor:'#dc2626',cls:'ab-delete'},search:{icon:'🔍',color:'rgba(245,158,11,.1)',textColor:'#d97706',cls:'ab-search'},export:{icon:'📥',color:'rgba(124,58,237,.1)',textColor:'#7c3aed',cls:'ab-export'},user:{icon:'👤',color:'rgba(16,185,129,.1)',textColor:'#059669',cls:'ab-user'},pass:{icon:'🔒',color:'rgba(239,68,68,.1)',textColor:'#dc2626',cls:'ab-pass'},warn:{icon:'⚠️',color:'rgba(239,68,68,.2)',textColor:'#dc2626',cls:'ab-warn'},security:{icon:'🚨',color:'rgba(239,68,68,.18)',textColor:'#dc2626',cls:'ab-security'}};
 function addAudit(type, action, details=''){
-  appState.audit.unshift({
+  const item={
     id:Date.now(), type, action, details,
     user:appState.user?.name??'—',
     role:appState.user?.role??'—',
     time:new Date().toLocaleString('ar-SA'),
     ip:'127.0.0.1'
-  });
+  };
+  appState.audit.unshift(item);
   if(appState.audit.length>500) appState.audit.pop();
   lsSave(LS.audit, appState.audit);
   sv('auditCount', appState.audit.length);
+  if(isSupabaseReady && isSupabaseReady()) sbAddAudit(item);
 }
 function renderAudit(){
   const filter=$('auditFilter')?.value||'all';
@@ -2391,6 +2762,13 @@ function doLogin(){
     $('loginScreen').style.display='none';$('appShell').style.display='flex';
     setupForRole(found.role);
     startAutoRefresh();
+    // تحميل البيانات من Supabase بعد تسجيل الدخول
+    if(isSupabaseReady && isSupabaseReady()){
+      Promise.all([sbLoadFiles(), sbLoadHistory(), sbLoadAudit(), sbLoadMessages()]).then(()=>{
+        updateAll();
+        startRealtimeSync();
+      });
+    }
     if(!checkForceChangePass(found)) toast(`✅ أهلاً ${found.name}!`,'ok');
   });
 }
@@ -3498,7 +3876,17 @@ function updateDashFiles(){const el=$('dashFiles');if(!el)return;el.innerHTML=!a
 function updateDashActivity(){const el=$('dashActivity');if(!el)return;el.innerHTML=!appState.history.length?'<div style="text-align:center;padding:26px;color:var(--s400);">🔍 لا توجد استعلامات بعد</div>':appState.history.slice(0,6).map(h=>`<div class="activity-item"><div class="activity-dot" style="background:${h.success?'var(--ok)':'var(--err)'}"></div><div><div style="font-size:12px;">بحث عن: <strong>${escHtml(String(h.id??''))}</strong> — ${escHtml(String(h.file??''))}</div><div class="text-sm text-muted">${escHtml(String(h.time??''))} · ${escHtml(String(h.user??''))}</div></div></div>`).join('');}
 function updateEmpDashboard(){const totalRecords=appState.files.reduce((s,f)=>s+f.data.length,0);const myH=appState.history.filter(h=>h.user===appState.user?.name);const succ=myH.filter(h=>h.success).length;sv('empStatFiles',appState.files.length);sv('empStatRecords',totalRecords);sv('empStatQueries',myH.length);sv('empStatSuccess',succ);sv('empStatFail',myH.length-succ);sv('empStatLast',myH[0]?.time??'—');const df=$('empDashFiles');if(df)df.innerHTML=!appState.files.length?'<div style="text-align:center;padding:26px;color:var(--s400);">📂 لم يتم رفع أي ملفات بعد</div>':appState.files.map(f=>`<div class="activity-item"><div class="activity-dot"></div><div class="u-flex1"><div style="font-size:12.5px;font-weight:700;">${escHtml(f.name)}</div><div class="text-sm text-muted">${f.data.length} سجل · ${escHtml(String(f.uploadedAt||''))}</div></div><button class="btn btn-danger btn-sm" onclick="deleteFileById(${f.id})" style="margin-right:8px;flex-shrink:0;">🗑</button></div>`).join('');const da=$('empDashActivity');if(da)da.innerHTML=!myH.length?'<div style="text-align:center;padding:20px;color:var(--s400);">لا توجد استعلامات بعد</div>':myH.slice(0,5).map(h=>`<div class="activity-item"><div class="activity-dot" style="background:${h.success?'var(--ok)':'var(--err)'}"></div><div><div style="font-size:12px;">بحث عن: <strong>${escHtml(String(h.id??''))}</strong></div><div class="text-sm text-muted">${escHtml(String(h.time??''))}</div></div></div>`).join('');}
 function deleteFileById(id){const f=appState.files.find(f=>f.id===id);if(!f)return;_pendingDeleteId=id;$('deleteFileName').textContent=f.name;$('deleteFileModal').classList.add('show');}
-function confirmDeleteFile(){const id=_pendingDeleteId;if(id===null)return;_pendingDeleteId=null;closeModal('deleteFileModal');const idx=appState.files.findIndex(f=>f.id===id);if(idx===-1)return;const name=appState.files[idx].name;appState.files.splice(idx,1);IDB.save(appState.files).catch(()=>{});updateAll();addAudit('delete',`حذف ملف: ${name}`,'');toast('🗑 تم حذف "'+name+'"','warn');}
+function confirmDeleteFile(){
+  const id=_pendingDeleteId;if(id===null)return;
+  _pendingDeleteId=null;closeModal('deleteFileModal');
+  const idx=appState.files.findIndex(f=>f.id===id);if(idx===-1)return;
+  const name=appState.files[idx].name;
+  appState.files.splice(idx,1);
+  IDB.save(appState.files).catch(()=>{});
+  if(isSupabaseReady && isSupabaseReady()) sbDeleteFile(id);
+  updateAll();addAudit('delete',`حذف ملف: ${name}`,'');
+  toast('🗑 تم حذف "'+name+'"','warn');
+}
 function previewFileById(id){const f=appState.files.find(f=>f.id===id);if(!f)return;let h='<div style="overflow-x:auto;max-height:380px;"><table style="min-width:100%"><thead><tr>'+f.headers.map(hd=>`<th style="background:var(--b50);padding:7px 12px;font-size:11px;border-bottom:1px solid var(--border);">${escHtml(String(hd))}<\/th>`).join('')+'</tr></thead><tbody>'+f.data.slice(0,20).map(row=>'<tr>'+f.headers.map((_,i)=>`<td style="padding:6px 12px;border-bottom:1px solid rgba(226,232,240,.4);font-size:11.5px;">${escHtml(String(row[i]??''))}<\/td>`).join('')+'</tr>').join('')+'</tbody></table></div>';const m=document.createElement('div');m.className='modal-ov show';m.innerHTML=`<div class="modal" style="max-width:800px;width:96%;"><div class="modal-hd"><div class="modal-title">📊 معاينة: ${escHtml(f.name)}</div><button class="modal-close" onclick="this.closest('.modal-ov').remove()">✕</button></div><p class="text-sm text-muted" style="margin-bottom:10px;">أول 20 سجل من ${f.data.length}</p>${h}</div>`;m.addEventListener('click',e=>{if(e.target===m)m.remove();});document.body.appendChild(m);}
 function exportFileById(id){const f=appState.files.find(f=>f.id===id);if(!f)return;const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([f.headers,...f.data.map(r=>f.headers.map((_,i)=>r[i]??''))]),'بيانات');safeExportXLSX(f.name.replace(/\.[^.]+$/,'')+'_export.xlsx',wb);addAudit('export',`تصدير ملف: ${f.name}`,'');}
 
@@ -3616,8 +4004,14 @@ async function handleSearch(page){
 const LS_INBOX = 'cc_inbox';
 let _inboxTab = 'inbox';
 
-function _getInbox(){ return lsLoad(LS_INBOX,[]); }
-function _saveInbox(arr){ lsSave(LS_INBOX,arr); }
+function _getInbox(){
+  if(isSupabaseReady && isSupabaseReady() && window._sbMessages) return window._sbMessages;
+  return lsLoad(LS_INBOX,[]);
+}
+function _saveInbox(arr){
+  lsSave(LS_INBOX,arr);
+  if(isSupabaseReady && isSupabaseReady()) window._sbMessages = arr;
+}
 
 /*     */
 function openInbox(){
@@ -3728,10 +4122,14 @@ function doSendInboxMsg(){
   const me=appState.user;
   const toUser=registeredUsers.find(u=>u.id===toId);
   const msgs=_getInbox();
-  msgs.push({id:Date.now(),fromId:me.id,fromName:me.name,fromRole:me.role,
+  const newMsg={id:Date.now(),fromId:me.id,fromName:me.name,fromRole:me.role,
     toId,toName:toUser?.name||'—',subject:subj,body,
-    time:new Date().toLocaleString('ar-SA'),read:false});
-  _saveInbox(msgs);
+    time:new Date().toLocaleString('ar-SA'),read:false};
+  if(isSupabaseReady && isSupabaseReady()){
+    sbSendMessage(newMsg).then(()=>sbLoadMessages());
+  } else {
+    msgs.push(newMsg); _saveInbox(msgs);
+  }
   subjInp.value=''; bodyInp.value='';
   updateInboxBadge();
   setInboxTab('sent',$('iTabSent'));
@@ -3815,7 +4213,16 @@ function resetClientSearch(){$('clientIdInput').value='';$('clientResultBox').st
 function shakeEl(id){const el=$(id);el.style.animation='none';el.offsetHeight;el.style.animation='waShake .4s ease';el.style.borderColor='var(--err)';setTimeout(()=>{el.style.borderColor='';el.style.animation='';},600);}
 
 /* HISTORY */
-function addHistory(id,fileIdx,success,response){appState.history.unshift({id,file:fileIdx>=0?(appState.files[fileIdx]?.name??'—'):'—',success,response,time:new Date().toLocaleString('ar-SA'),user:appState.user?.name??'—',_ts:Date.now()});if(appState.history.length>1000)appState.history=appState.history.slice(0,1000);lsSave(LS.history,appState.history);sv('historyCount',appState.history.length);updateDashActivity();updateStats();}
+function addHistory(id,fileIdx,success,response){
+  const item={id,file:fileIdx>=0?(appState.files[fileIdx]?.name??'—'):'—',success,response,
+    time:new Date().toLocaleString('ar-SA'),user:appState.user?.name??'—',_ts:Date.now()};
+  appState.history.unshift(item);
+  if(appState.history.length>1000)appState.history=appState.history.slice(0,1000);
+  lsSave(LS.history,appState.history);
+  sv('historyCount',appState.history.length);
+  updateDashActivity();updateStats();
+  if(isSupabaseReady && isSupabaseReady()) sbAddHistory(item);
+}
 function renderHistory(){
 const wrap=$('historyWrap');if(!wrap)return;
 const fromVal=document.getElementById('histDateFrom')?.value;
@@ -3844,12 +4251,22 @@ const start=(_pg.history-1)*ps, slice=list.slice(start,start+ps);
 }
 function renderPagination(cid,total,current,onChange,ps){const el=$(cid);if(!el)return;const _ps=ps||_pg.PAGE_SIZE,pages=Math.ceil(total/_ps);if(pages<=1){el.innerHTML='';return;}if(pages<=1){el.innerHTML='';return;}el._pgOnChange=onChange;const btn=(p,lbl,dis)=>`<button class="pg-btn${p===current?' active':''}" ${dis?'disabled':''} onclick="document.getElementById('${cid}')._pgOnChange(${p})">${lbl}</button>`;let h=`<span class="pg-info">صفحة ${current} من ${pages}</span>`;h+=btn(1,'«',current===1);h+=btn(current-1,'‹',current===1);const start=Math.max(1,current-2),end=Math.min(pages,current+2);for(let p=start;p<=end;p++)h+=btn(p,p,false);h+=btn(current+1,'›',current===pages);h+=btn(pages,'»',current===pages);h+=`<span class="pg-info">${total} سجل</span>`;el.innerHTML=h;}
 function showResp(idx){const h=appState.history[idx];if(!h)return;const m=document.createElement('div');m.className='modal-ov show';m.innerHTML=`<div class="modal"><div class="modal-hd"><div class="modal-title">💬 رد: ${escHtml(String(h.id??''))}</div><button class="modal-close" onclick="this.closest('.modal-ov').remove()">✕</button></div><div class="ai-text"></div><button class="btn btn-primary btn-full" style="margin-top:14px;" onclick="this.closest('.modal-ov').remove()">إغلاق</button></div>`;m.querySelector('.ai-text').textContent=h.response??'';m.addEventListener('click',e=>{if(e.target===m)m.remove();});document.body.appendChild(m);}
-function deleteHistItem(idx){appState.history.splice(idx,1);lsSave(LS.history,appState.history);sv('historyCount',appState.history.length);const tp=Math.ceil(appState.history.length/_pg.PAGE_SIZE)||1;if(_pg.history>tp)_pg.history=tp;renderHistory();updateStats();toast('🗑 تم الحذف','warn');}
+function deleteHistItem(idx){
+  const item = appState.history[idx];
+  if(item?._sbId && isSupabaseReady && isSupabaseReady()) sbDeleteHistoryItem(item._sbId);
+  appState.history.splice(idx,1);
+  lsSave(LS.history,appState.history);
+  sv('historyCount',appState.history.length);
+  const tp=Math.ceil(appState.history.length/_pg.PAGE_SIZE)||1;
+  if(_pg.history>tp)_pg.history=tp;
+  renderHistory();updateStats();toast('🗑 تم الحذف','warn');
+}
 function clearHistory(){
   const n=appState.history.length;
   if(!n){toast('⚠️ السجل فارغ بالفعل','warn');return;}
   showConfirm(`⚠️ سيتم حذف <b>${n}</b> استعلام نهائياً؟`,()=>{
   appState.history=[];sv('historyCount','0');lsSave(LS.history,[]);_pg.history=1;renderHistory();updateStats();
+  if(isSupabaseReady && isSupabaseReady()) sbClearHistory();
   toast(`🗑 تم حذف ${n} استعلام`,'warn');
   addNotif('🗑',`مسح السجل`,`تم حذف ${n} استعلام`);
   });
@@ -4272,6 +4689,7 @@ async function saveSettings(){if(!requireAuth('saveSettings'))return;
   const urlField=$('settingsOrgLogoUrl').value.trim();if(urlField)appState.settings.orgLogo=urlField;
   const toSave={...appState.settings, apiKey:''}; // لا نحفظ المفتاح نصاً
   lsSave(LS.settings,toSave);
+  if(isSupabaseReady && isSupabaseReady()) sbSaveSettings('system', toSave);
   applySidebarBrand();addAudit('user','تعديل إعدادات النظام','');
   // مؤشر بصري على زر الحفظ
   const saveBtns=document.querySelectorAll('#page-settings .btn-primary');
@@ -5722,17 +6140,4 @@ function showBreachAlert(username, attempts, email, timestamp){
     <div class="hm-footer-bar">
       <span class="hm-version">Customer Care System v1.0</span>
       <div style="display:flex;gap:8px;align-items:center;">
-        <button onclick="printHelpGuide()" style="display:flex;align-items:center;gap:6px;padding:7px 14px;background:var(--b50);border:1.5px solid var(--b200);border-radius:9px;cursor:pointer;font-family:Cairo,sans-serif;font-size:12px;font-weight:700;color:var(--b700);transition:all .2s;" onmouseover="this.style.background='var(--b100)'" onmouseout="this.style.background='var(--b50)'">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
-          طباعة الدليل
-        </button>
-        <button onclick="closeHelpGuide()" style="display:flex;align-items:center;gap:6px;padding:7px 14px;background:linear-gradient(135deg,var(--b600),var(--b700));border:none;border-radius:9px;cursor:pointer;font-family:Cairo,sans-serif;font-size:12px;font-weight:700;color:#fff;transition:all .2s;" onmouseover="this.style.opacity='.88'" onmouseout="this.style.opacity='1'">
-          ✕ إغلاق
-        </button>
-      </div>
-    </div>
-  </div>
-</div>
-
-</body>
-</html>
+        <button onclick="printHelpGuide()" style="display:flex;align-items:center;gap:6px;padding:7px 14px;background:var(--b50);border:1.5px solid var(--b200);border-radius:9px;cursor:pointer;font-family:Cairo,sans-serif;font-size:12px;font-weight:700;color:var(--b700);transitio
